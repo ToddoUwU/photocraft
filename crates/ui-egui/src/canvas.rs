@@ -1996,9 +1996,9 @@ fn start_screen(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     });
 }
 
-/// Wayland has no native file drops (winit 0.30, #386), so the hint offers File › Open and paste.
+/// Without native file drops on Wayland (stock winit 0.30, #386), the hint offers File › Open and paste.
 fn start_screen_drop_hint(app: &PhotocraftApp) -> std::borrow::Cow<'static, str> {
-    if app.services.is_wayland {
+    if app.services.is_wayland && !app.services.wayland_file_drops {
         crate::i18n::fmt(tl!("Use File › Open, or paste a copied image with {paste}."), &[("paste", &crate::notices::paste_hint(app))]).into()
     } else {
         tl!("Drop an image or PSD anywhere to open it.").into()
@@ -4410,6 +4410,10 @@ mod tests {
         let hint = start_screen_drop_hint(&wayland);
         assert!(!hint.contains("Drop"), "{hint}");
         assert!(hint.ends_with(&format!("paste a copied image with {}.", crate::notices::paste_hint(&wayland))), "{hint}");
+        // With native Wayland drops (patched winit) the drop hint is true again.
+        let native =
+            PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services { is_wayland: true, wayland_file_drops: true, ..Default::default() });
+        assert!(start_screen_drop_hint(&native).starts_with("Drop"));
     }
 
     #[test]

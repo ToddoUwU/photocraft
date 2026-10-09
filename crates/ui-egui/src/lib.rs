@@ -285,6 +285,9 @@ pub struct Services {
     pub save_prefs: Option<SaveTextFn>,
     /// The native window is connected directly to a Wayland compositor.
     pub is_wayland: bool,
+    /// On Wayland, native file drops arrive (the patched winit); the File › Open / XWayland
+    /// fallback hints stay hidden.
+    pub wayland_file_drops: bool,
     /// On Wayland, the shell command that starts this install under XWayland, where native file
     /// drops work (#386); `None` when there is no X server to run it on.
     pub xwayland_command: Option<String>,

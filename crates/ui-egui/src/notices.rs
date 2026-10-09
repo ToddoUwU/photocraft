@@ -65,6 +65,7 @@ pub(crate) fn paste_hint(app: &PhotocraftApp) -> String {
 /// command that starts this install under XWayland (where drops work), when there is one.
 pub fn wayland_file_drop_guidance(app: &mut PhotocraftApp) {
     if !app.services.is_wayland
+        || app.services.wayland_file_drops
         || app.session.prefs().dialogs.get(WAYLAND_FILE_DROP_DISMISSED).and_then(serde_json::Value::as_bool) == Some(true)
         || app.ui.notices.iter().any(|notice| notice.dismiss_pref.as_deref() == Some(WAYLAND_FILE_DROP_DISMISSED))
     {
@@ -248,6 +249,12 @@ mod tests {
         let guidance = english(&app.ui.notices[0]);
         assert!(guidance.contains("File › Open"));
         assert!(!guidance.contains("XWayland"), "{guidance}");
+    }
+
+    #[test]
+    fn wayland_with_native_file_drops_posts_no_guidance() {
+        let app = PhotocraftApp::new(Session::new(), Services { is_wayland: true, wayland_file_drops: true, ..Default::default() });
+        assert!(app.ui.notices.iter().all(|notice| notice.dismiss_pref.as_deref() != Some(WAYLAND_FILE_DROP_DISMISSED)));
     }
 
     #[test]

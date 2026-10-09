@@ -338,7 +338,8 @@ fn main() -> eframe::Result {
             #[cfg(target_os = "linux")]
             {
                 services.is_wayland = display == Some(tablet::DisplayKind::Wayland);
-                if services.is_wayland {
+                services.wayland_file_drops = services.is_wayland && winit::platform::wayland::FILE_DROPS;
+                if services.is_wayland && !services.wayland_file_drops {
                     let var = |name| std::env::var(name).ok();
                     services.xwayland_command =
                         services::xwayland_command(var("FLATPAK_ID").as_deref(), var("APPIMAGE").as_deref(), std::env::var_os("DISPLAY").is_some());

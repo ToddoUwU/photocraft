@@ -85,6 +85,12 @@ lto = "fat"
 codegen-units = 1
 strip = "debuginfo"
 
+# PersonalUpdates: winit 0.30.13 plus native Wayland file drag and drop, from the
+# `wayland-support-for-photocraft` branch of the ToddoUwU/winit fork (never sent upstream).
+# Remove once eframe moves to winit 0.31, which has its own Wayland drops.
+[patch.crates-io]
+winit = { git = "https://github.com/ToddoUwU/winit", branch = "wayland-support-for-photocraft" }
+
 [profile.wasm-release.package."*"]
 opt-level = "s"
 
