@@ -26,6 +26,20 @@ pub struct PenPath {
     /// Re-dragging the final anchor changes its outgoing control only; the incoming curve stays put.
     #[serde(skip)]
     pub adjusting_last: bool,
+    /// Drawn with the Curvature Pen: handles follow the anchors (`curvature_refresh`) and
+    /// `unlinked` lists its corner points.
+    #[serde(default)]
+    pub curvature: bool,
+    /// Curvature Pen: the anchor being dragged.
+    #[serde(skip)]
+    pub moving: Option<usize>,
+}
+
+impl PenPath {
+    /// Does `tool` keep drawing this path? Another tool finishes it.
+    pub fn drawn_with(&self, tool: Tool) -> bool {
+        tool == if self.curvature { Tool::CurvaturePen } else { Tool::Pen }
+    }
 }
 
 pub fn is_shape_tool(t: Tool) -> bool {
@@ -44,7 +58,13 @@ fn hex(c: [f32; 4]) -> String {
 
 fn stroke_param(app: &PhotocraftApp) -> Value {
     let o = &app.ui.tool_options;
-    if o.stroke_width > 0.0 { json!({"width": o.stroke_width, "color": hex(app.session.tools.background)}) } else { Value::Null }
+    if o.stroke_width <= 0.0 {
+        return Value::Null;
+    }
+    let mut p = o.shape_stroke.params();
+    p["width"] = json!(o.stroke_width);
+    p["color"] = json!(hex(app.session.tools.background));
+    p
 }
 
 /// Geometry of a Shape-tool drag as `shape.create` params, without fill and stroke (None when too
@@ -113,19 +133,40 @@ pub fn create_shape(app: &mut PhotocraftApp, mut geometry: Value) -> Result<Valu
     app.run("shape.create", geometry)
 }
 
-/// Shape-tool drag preview: the shape `finish_shape` will create, filled and stroked, under its
-/// path outline. Custom shapes show their box outline only.
+/// Shape-tool drag preview using the same path and vector stroke geometry as the commit.
 pub fn draw_shape_preview(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform, tool: Tool, start: [f64; 2], end: [f64; 2], mods: egui::Modifiers) {
     let o = &app.ui.tool_options;
-    let Some(path) = shape_geometry(o, tool, start, end, mods).and_then(|p| photocraft_engine::vector_cmds::shape_path(&p).ok()) else { return };
-    let custom = tool == Tool::CustomShape;
+    let Some(geometry) = shape_geometry(o, tool, start, end, mods) else { return };
+    let path = if tool == Tool::CustomShape {
+        let Some(rect) = geometry.get("rect").and_then(|r| serde_json::from_value::<[f64; 4]>(r.clone()).ok()) else { return };
+        let groups = photocraft_engine::presets::shapes::all_groups(&app.session);
+        let Some(shape) = groups.iter().flat_map(|g| &g.items).find(|s| s.name == app.ui.presets_ui.shape()) else { return };
+        photocraft_engine::presets::shapes::fit(&shape.path, rect, mods.shift)
+    } else {
+        let Ok(path) = photocraft_engine::vector_cmds::shape_path(&geometry) else { return };
+        path
+    };
     // ponytail: preview colours skip the canvas's colour management; the commit renders them exactly.
-    let fill = if o.shape_fill && !custom { rgb32(app.session.tools.foreground) } else { Color32::TRANSPARENT };
-    let stroke = if o.stroke_width > 0.0 && !custom { Stroke::new(o.stroke_width * xf.zoom, rgb32(app.session.tools.background)) } else { Stroke::NONE };
+    let fill = if o.shape_fill { rgb32(app.session.tools.foreground) } else { Color32::TRANSPARENT };
+    {
+        let origin = xf.to_screen(0.0, 0.0);
+        let x = xf.to_screen(1.0, 0.0) - origin;
+        let y = xf.to_screen(0.0, 1.0) - origin;
+        let transform = Affine { m: [x.x as f64, x.y as f64, y.x as f64, y.y as f64, origin.x as f64, origin.y as f64] };
+        let c = app.session.tools.background;
+        let shape = photocraft_doc::ShapeLayer {
+            path: path.transform(&transform),
+            fill: (fill != Color32::TRANSPARENT).then(|| {
+                photocraft_doc::Fill::Solid(photocraft_doc::Color::rgba(fill.r() as f32 / 255.0, fill.g() as f32 / 255.0, fill.b() as f32 / 255.0, 1.0))
+            }),
+            stroke: (o.stroke_width > 0.0)
+                .then(|| o.shape_stroke.stroke(o.stroke_width * xf.zoom, photocraft_doc::Fill::Solid(photocraft_doc::Color::rgba(c[0], c[1], c[2], c[3])))),
+            ..Default::default()
+        };
+        crate::shape_stroke_ui::paint_shape_preview(painter, &shape);
+    }
     let accent = Tokens::get(painter.ctx()).accent;
     for (pts, _) in path_lines(&path, &|q| xf.to_screen(q[0] as f32, q[1] as f32)) {
-        // Every tool's own shape is convex (custom shapes aren't, and draw no fill).
-        painter.add(egui::Shape::convex_polygon(pts.clone(), fill, stroke));
         // The accent path over a dark halo: visible on any pixels (#172).
         painter.extend(crate::tool_feedback::contrast_path(pts, true, accent));
     }
@@ -193,6 +234,11 @@ pub fn pen_undo_last_point(app: &mut PhotocraftApp) -> bool {
     if pen.knots.pop().is_none() {
         return false;
     }
+    pen.unlinked.retain(|&i| i < pen.knots.len());
+    if pen.curvature {
+        pen.moving = None;
+        curvature_refresh(pen, false);
+    }
     pen.dragging = false;
     if pen.knots.is_empty() {
         app.ui.pen = None;
@@ -209,15 +255,30 @@ pub fn pen_up(app: &mut PhotocraftApp) {
 
 /// Finish the pen path: a work path (Path mode) or a new shape layer (Shape mode).
 pub fn pen_commit(app: &mut PhotocraftApp, closed: bool) {
-    let Some(pen) = app.ui.pen.take() else { return };
+    let Some(mut pen) = app.ui.pen.take() else { return };
+    if pen.curvature {
+        curvature_refresh(&mut pen, closed);
+    }
+    commit_path(app, &pen, closed);
+}
+
+/// Commit a finished Pen, Freeform Pen or Curvature Pen path, as one History step: a new shape
+/// layer (Shape mode), else a subpath of the targeted vector mask, else the work path.
+fn commit_path(app: &mut PhotocraftApp, pen: &PenPath, closed: bool) {
     if pen.knots.len() < 2 {
         return;
     }
-    let path = pen_to_json(&pen, closed);
+    let path = pen_to_json(pen, closed);
     let r = if app.ui.tool_options.vector_mode == "shape" {
         let fill = if closed && app.ui.tool_options.shape_fill { json!(hex(app.session.tools.foreground)) } else { Value::Null };
-        let stroke =
-            if closed { stroke_param(app) } else { json!({"width": app.ui.tool_options.stroke_width.max(1.0), "color": hex(app.session.tools.foreground)}) };
+        let stroke = if closed {
+            stroke_param(app)
+        } else {
+            let mut stroke = app.ui.tool_options.shape_stroke.params();
+            stroke["width"] = json!(app.ui.tool_options.stroke_width.max(1.0));
+            stroke["color"] = json!(hex(app.session.tools.foreground));
+            stroke
+        };
         app.run("shape.create", json!({"kind": "path", "path": path, "fill": fill, "stroke": stroke}))
     } else if let Some((id, existing)) = targeted_vector_mask(app) {
         // A targeted vector mask takes the new subpath (#196), as in Photoshop.
@@ -234,6 +295,90 @@ pub fn pen_commit(app: &mut PhotocraftApp, closed: bool) {
         app.ui.status = e;
         app.ui.status_error = true;
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Freeform Pen and Curvature Pen
+
+/// Freeform Pen release: fit the drag's trace within the options bar's Curve Fit and commit it
+/// as the Pen does. Releasing on the start point closes the path; a click draws nothing.
+pub fn freeform_finish(app: &mut PhotocraftApp, points: &[[f64; 3]]) {
+    let trace: Vec<[f64; 2]> = points.iter().map(|p| [p[0], p[1]]).collect();
+    let (Some(first), Some(last)) = (trace.first(), trace.last()) else { return };
+    let tol = 6.0 / app.point_zoom().max(0.01) as f64;
+    let length: f64 = trace.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum();
+    let closed = (first[0] - last[0]).hypot(first[1] - last[1]) < tol && length > 4.0 * tol;
+    let Some(sub) = photocraft_vector::trace::fit_trace(&trace, f64::from(app.ui.tool_options.curve_fit), closed) else { return };
+    let knots = sub.knots.iter().map(|k| [[k.anchor.x, k.anchor.y], [k.in_ctrl.x, k.in_ctrl.y], [k.out_ctrl.x, k.out_ctrl.y]]).collect();
+    let unlinked = sub.knots.iter().enumerate().filter(|(_, k)| !k.smooth).map(|(i, _)| i).collect();
+    commit_path(app, &PenPath { knots, unlinked, ..Default::default() }, sub.closed);
+}
+
+/// Recompute a Curvature Pen path's handles from its anchors and corner points.
+fn curvature_refresh(pen: &mut PenPath, closed: bool) {
+    let anchors: Vec<[f64; 2]> = pen.knots.iter().map(|k| k[0]).collect();
+    let corners: Vec<bool> = (0..anchors.len()).map(|i| pen.unlinked.contains(&i)).collect();
+    pen.knots = photocraft_vector::edit::curvature_knots(&anchors, &corners, closed);
+}
+
+/// The Curvature Pen's anchor within a few screen pixels of (x, y).
+fn curvature_hit(app: &PhotocraftApp, x: f64, y: f64) -> Option<usize> {
+    let tol = 6.0 / app.point_zoom().max(0.01) as f64;
+    let pen = app.ui.pen.as_ref().filter(|p| p.curvature)?;
+    pen.knots
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (i, (k[0][0] - x).hypot(k[0][1] - y)))
+        .filter(|(_, d)| *d < tol)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
+/// Curvature Pen press: clicking the first anchor closes the path, pressing another anchor
+/// grabs it to move, anywhere else adds a smooth anchor (still draggable until the release).
+pub fn curvature_down(app: &mut PhotocraftApp, x: f64, y: f64) {
+    if app.ui.pen.as_ref().is_some_and(|p| !p.curvature) {
+        pen_commit(app, false);
+    }
+    let hit = curvature_hit(app, x, y);
+    if hit == Some(0) && app.ui.pen.as_ref().is_some_and(|p| p.knots.len() >= 3) {
+        pen_commit(app, true);
+        return;
+    }
+    let pen = app.ui.pen.get_or_insert_with(|| PenPath { curvature: true, ..Default::default() });
+    if hit.is_none() {
+        pen.knots.push([[x, y]; 3]);
+    }
+    pen.moving = hit.or(pen.knots.len().checked_sub(1));
+    curvature_refresh(pen, false);
+}
+
+pub fn curvature_move(app: &mut PhotocraftApp, x: f64, y: f64) {
+    if let Some(pen) = app.ui.pen.as_mut().filter(|p| p.curvature)
+        && let Some(k) = pen.moving.and_then(|i| pen.knots.get_mut(i))
+    {
+        k[0] = [x, y];
+        curvature_refresh(pen, false);
+    }
+}
+
+pub fn curvature_up(app: &mut PhotocraftApp) {
+    if let Some(pen) = app.ui.pen.as_mut() {
+        pen.moving = None;
+    }
+}
+
+/// Curvature Pen double-click: toggle the anchor under the pointer between smooth and corner
+/// (double-clicking empty canvas therefore places a corner point, as in Photoshop).
+pub fn curvature_toggle(app: &mut PhotocraftApp, x: f64, y: f64) {
+    let Some(i) = curvature_hit(app, x, y) else { return };
+    let Some(pen) = app.ui.pen.as_mut() else { return };
+    if let Some(at) = pen.unlinked.iter().position(|&c| c == i) {
+        pen.unlinked.remove(at);
+    } else {
+        pen.unlinked.push(i);
+    }
+    curvature_refresh(pen, false);
 }
 
 /// The path that path commands act on without a name: the one selected in the Paths panel, else
@@ -436,7 +581,7 @@ pub(crate) fn draw_handle(painter: &egui::Painter, anchor: Pos2, handle: Pos2, a
 /// Work path / active shape path outlines, anchors, and the pen path in progress.
 pub fn draw_overlay(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform, doc: &Document) {
     let tool = app.ui.tool;
-    let vector_tool = matches!(tool, Tool::Pen | Tool::PathSelection) || is_shape_tool(tool);
+    let vector_tool = matches!(tool, Tool::Pen | Tool::FreeformPen | Tool::CurvaturePen | Tool::PathSelection) || is_shape_tool(tool);
     let accent = Tokens::get(painter.ctx()).accent;
     let to_scr = |q: [f64; 2]| xf.to_screen(q[0] as f32, q[1] as f32);
     let draw_path = |p: &Path, anchors: bool| {
@@ -449,10 +594,13 @@ pub fn draw_overlay(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform
     };
     // View › Show › Target Path (under Extras) hides the paths; the Pen's path in progress stays.
     // Free Transform Path draws the path through its box instead (transform_tool).
-    let paths = app.ui.view.shows(app.ui.view.show.target_path) && !app.ui.transform.as_ref().is_some_and(|t| t.path.is_some());
+    let paths = app.ui.view.shows(app.ui.view.show.target_path) && app.ui.transform.as_ref().is_none_or(|t| t.path.is_none());
     if crate::direct_select::shows(app, painter.ctx().input(|i| i.modifiers)) {
         // Direct Selection (or the Pen with ⌘/Ctrl held) draws the paths it edits (#790).
         crate::direct_select::draw_overlay(app, painter, &to_scr, accent, paths);
+        if paths {
+            crate::anchor_tools::draw_hover(app, painter, &to_scr, accent, painter.ctx().input(|i| i.modifiers));
+        }
     } else if paths {
         if vector_tool {
             if let Some(wp) = &doc.work_path {
@@ -481,13 +629,25 @@ pub fn draw_overlay(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform
         painter.add(egui::Shape::line(pts, Stroke::new(1.5, accent)));
         if let (Some(last), Some(h)) = (pen.knots.last(), app.hover_doc)
             && !pen.dragging
+            && pen.moving.is_none()
         {
-            painter.add(egui::Shape::dashed_line(&[to_scr(last[0]), to_scr(h)], Stroke::new(1.0, accent), 4.0, 3.0));
+            if pen.curvature && pen.knots.len() >= 2 {
+                // The Curvature Pen previews the curve the next click makes through the pointer.
+                let mut next = pen.clone();
+                next.knots.push([h; 3]);
+                curvature_refresh(&mut next, false);
+                if let [.., a, b] = next.knots.as_slice() {
+                    let pts: Vec<Pos2> = (0..=24).map(|k| to_scr(bezier(a[0], a[2], b[1], b[0], k as f64 / 24.0))).collect();
+                    painter.add(egui::Shape::dashed_line(&pts, Stroke::new(1.0, accent), 4.0, 3.0));
+                }
+            } else {
+                painter.add(egui::Shape::dashed_line(&[to_scr(last[0]), to_scr(h)], Stroke::new(1.0, accent), 4.0, 3.0));
+            }
         }
         for (i, k) in pen.knots.iter().enumerate() {
             let c = to_scr(k[0]);
             let last = i + 1 == pen.knots.len();
-            if last && k[2] != k[0] {
+            if last && k[2] != k[0] && !pen.curvature {
                 for hnd in [k[1], k[2]] {
                     draw_handle(painter, c, to_scr(hnd), accent);
                 }
@@ -502,7 +662,12 @@ pub fn draw_overlay(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform
 
 /// Options bar for vector tools; false for other tools.
 pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bool {
-    if !(is_shape_tool(tool) || matches!(tool, Tool::Pen | Tool::PathSelection | Tool::DirectSelection)) {
+    if !(is_shape_tool(tool)
+        || matches!(
+            tool,
+            Tool::Pen | Tool::FreeformPen | Tool::CurvaturePen | Tool::AddAnchorPoint | Tool::DeleteAnchorPoint | Tool::PathSelection | Tool::DirectSelection
+        ))
+    {
         return false;
     }
     let t = Tokens::get(ui.ctx());
@@ -525,17 +690,42 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
         );
         return true;
     }
-    if tool == Tool::Pen {
+    if matches!(tool, Tool::AddAnchorPoint | Tool::DeleteAnchorPoint) {
+        let hint = if tool == Tool::AddAnchorPoint {
+            tl!("Click a segment to add an anchor point · {alt}-click an anchor to delete it")
+        } else {
+            tl!("Click an anchor point to delete it · {alt}-click a segment to add one")
+        };
+        lbl(ui, &crate::i18n::fmt(hint, &[("alt", &crate::shortcuts::pretty("Alt"))]));
+        return true;
+    }
+    if matches!(tool, Tool::Pen | Tool::FreeformPen | Tool::CurvaturePen) {
         let opts = [("path".to_string(), tl!("Path")), ("shape".to_string(), tl!("Shape"))];
         crate::widgets::dropdown(ui, "pen-mode", &mut o.vector_mode, &opts, 80.0);
         crate::widgets::vline(ui, 22.0);
-        lbl(
-            ui,
-            &crate::i18n::fmt(
-                tl!("Click: corner · Drag: smooth · Click first point: close · {key} finish · Esc cancel"),
-                &[("key", &crate::shortcuts::pretty("Enter"))],
+        if o.vector_mode == "shape" {
+            crate::widgets::value_field(ui, &mut o.stroke_width, 0.0..=288.0, "px", 58.0);
+            if let Some(style) = crate::shape_stroke_ui::button(ui, "pen-stroke", &o.shape_stroke, &mut app.ui.stroke_editor, false, true, None) {
+                o.shape_stroke = style;
+            }
+        }
+        let enter = crate::shortcuts::pretty("Enter");
+        match tool {
+            Tool::FreeformPen => {
+                crate::widgets::vline(ui, 22.0);
+                lbl(ui, tl!("Curve Fit:"));
+                crate::widgets::value_field(ui, &mut o.curve_fit, 0.5..=10.0, "px", 58.0);
+                lbl(ui, tl!("Drag: draw freehand · Release on the start point: close"));
+            }
+            Tool::CurvaturePen => lbl(
+                ui,
+                &crate::i18n::fmt(
+                    tl!("Click: smooth point · Double-click: corner · Drag a point: move · Click first point: close · {key} finish"),
+                    &[("key", &enter)],
+                ),
             ),
-        );
+            _ => lbl(ui, &crate::i18n::fmt(tl!("Click: corner · Drag: smooth · Click first point: close · {key} finish · Esc cancel"), &[("key", &enter)])),
+        }
         return true;
     }
     let mut mode = "shape".to_string();
@@ -547,7 +737,12 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
     ui.painter().rect_filled(r, 2.0, rgb32(app.session.tools.foreground));
     ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, t.field_border), egui::StrokeKind::Outside);
     lbl(ui, tl!("Stroke:"));
+    let bg = app.session.tools.background;
+    let stroke_color = swatch(ui, Some(&photocraft_doc::Fill::Solid(photocraft_doc::Color::rgba(bg[0], bg[1], bg[2], bg[3]))), tl!("Stroke color"));
     crate::widgets::value_field(ui, &mut o.stroke_width, 0.0..=288.0, "px", 58.0);
+    if let Some(style) = crate::shape_stroke_ui::button(ui, "tool-stroke", &o.shape_stroke, &mut app.ui.stroke_editor, true, tool != Tool::EllipseShape, None) {
+        o.shape_stroke = style;
+    }
     match tool {
         Tool::Rectangle => {
             crate::widgets::vline(ui, 22.0);
@@ -572,6 +767,14 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
             crate::preset_panels::shape_picker(app, ui);
         }
         _ => {}
+    }
+    if let Some(color) = stroke_color {
+        if color == "none" {
+            app.ui.tool_options.stroke_width = 0.0;
+        } else if let Err(e) = app.run("tools.setColors", json!({"background": color})) {
+            app.ui.status = e;
+            app.ui.status_error = true;
+        }
     }
     true
 }
@@ -661,6 +864,12 @@ fn corner_radii_patch(radii: [f64; 4], corner: usize, radius: f32) -> Value {
 
 /// Properties panel for a shape layer: Appearance (fill, stroke) and live shape geometry.
 pub fn shape_properties(app: &mut PhotocraftApp, ui: &mut egui::Ui, id: photocraft_doc::LayerId) {
+    if app.session.active().is_some_and(|st| {
+        let locks = st.doc.effective_locks(id);
+        locks.all || locks.pixels
+    }) {
+        ui.disable();
+    }
     let Some(sh) = app.session.active().and_then(|s| s.doc.layer(id)).and_then(|l| match &l.content {
         LayerContent::Shape(sh) => Some(sh.clone()),
         _ => None,
@@ -669,7 +878,8 @@ pub fn shape_properties(app: &mut PhotocraftApp, ui: &mut egui::Ui, id: photocra
     };
     let t = Tokens::get(ui.ctx());
     let mut edit: Option<Value> = None;
-    let key = |k: &str| format!("shape-{}-{k}", id.0);
+    let doc_id = app.session.active().map(|st| st.doc.id);
+    let key = |k: &str| format!("shape-{doc_id:?}-{}-{k}", id.0);
     // The shared collapsible section headers (#155).
     if crate::props_layout::section(ui, "appearance", tl!("Appearance")) {
         ui.horizontal(|ui| {
@@ -690,19 +900,21 @@ pub fn shape_properties(app: &mut PhotocraftApp, ui: &mut egui::Ui, id: photocra
             if crate::widgets::value_field(ui, &mut w, 0.0..=288.0, "px", 60.0).changed() {
                 edit = Some(if w <= 0.0 { json!({"stroke": null}) } else { json!({"stroke": {"width": w}, "coalesce": key("stroke-w")}) });
             }
-            if sh.stroke.is_some() {
-                let mut align = match sh.stroke.as_ref().map(|s| s.align) {
-                    Some(photocraft_doc::vector::StrokeAlign::Inside) => "inside",
-                    Some(photocraft_doc::vector::StrokeAlign::Outside) => "outside",
-                    _ => "center",
-                }
-                .to_string();
-                let opts = [("inside".to_string(), "Inside"), ("center".to_string(), "Center"), ("outside".to_string(), "Outside")];
-                if crate::widgets::dropdown(ui, &key("align"), &mut align, &opts, 84.0) {
-                    edit = Some(json!({"stroke": {"align": align}}));
-                }
-            }
         });
+        if let Some(stroke) = &sh.stroke {
+            let style = crate::shape_stroke_ui::StrokeOptions::from(stroke);
+            if let Some(next) = crate::shape_stroke_ui::button(
+                ui,
+                &key("style"),
+                &style,
+                &mut app.ui.stroke_editor,
+                sh.path.subpaths.iter().all(|s| s.closed),
+                !matches!(sh.live, Some(photocraft_doc::LiveShape::Ellipse { .. })),
+                app.session.active().map(|st| (st.doc.id, id)),
+            ) {
+                edit = Some(json!({"stroke": next.params()}));
+            }
+        }
     }
     if let Some(live) = &sh.live
         && crate::props_layout::section(ui, "liveShape", tl!("Shape"))
@@ -1019,6 +1231,38 @@ pub fn paths_panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn all_shape_tools_and_open_pen_use_the_complete_stroke_defaults() {
+        for tool in [Tool::Rectangle, Tool::EllipseShape, Tool::Triangle, Tool::Polygon, Tool::Line, Tool::CustomShape] {
+            let mut a = app();
+            a.ui.tool_options.stroke_width = 5.0;
+            a.ui.tool_options.shape_stroke = crate::shape_stroke_ui::StrokeOptions {
+                cap: photocraft_doc::LineCap::Square,
+                join: photocraft_doc::LineJoin::Bevel,
+                dashes: vec![4.0, 2.0, 1.0, 3.0],
+                dash_offset: -0.5,
+                opacity: 0.4,
+                ..Default::default()
+            };
+            let history = a.session.active().unwrap().history.past_len();
+            finish_shape(&mut a, tool, [20.0, 20.0], [120.0, 100.0], Default::default());
+            let info = a.run("shape.info", json!({})).unwrap();
+            assert_eq!(info["stroke"]["dashes"], json!([4.0, 2.0, 1.0, 3.0]));
+            assert_eq!(info["stroke"]["cap"], "square");
+            assert_eq!(info["stroke"]["width"], 5.0);
+            assert_eq!(a.session.active().unwrap().history.past_len(), history + 1);
+            a.run("edit.undo", json!({})).unwrap();
+            a.run("edit.redo", json!({})).unwrap();
+            assert_eq!(a.run("shape.info", json!({})).unwrap(), info);
+            a.ui.tool_options.vector_mode = "shape".into();
+            a.ui.pen = Some(PenPath { knots: vec![[[30.0, 40.0]; 3], [[80.0, 40.0]; 3]], ..Default::default() });
+            pen_commit(&mut a, false);
+            let open = a.run("shape.info", json!({})).unwrap();
+            assert_eq!(open["stroke"]["dashes"], info["stroke"]["dashes"]);
+            assert_eq!(open["path"]["subpaths"][0]["closed"], false);
+        }
+    }
+
     fn app() -> PhotocraftApp {
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
         app.session.execute("file.new", json!({"width": 200, "height": 200})).unwrap();
@@ -1075,7 +1319,7 @@ mod tests {
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             let rect = Rect::from_min_size(Pos2::ZERO, vec2(400.0, 400.0));
             let painter = ui.ctx().layer_painter(egui::LayerId::background()).with_clip_rect(rect);
-            let xf = ViewXform { rect, zoom: 1.0, center: [100.0, 100.0], flip: false, rotation: 0.0 };
+            let xf = ViewXform { rect, zoom: 1.0, center: [100.0, 100.0], flip: false, rotation: 0.0, aspect: 1.0 };
             draw_overlay(app, &painter, &xf, &doc);
         });
         out.textures_delta.clear();
